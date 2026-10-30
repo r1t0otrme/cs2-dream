@@ -49,6 +49,7 @@ const defaults = () => ({
   sort: 'price-desc',
   ordFilter: 0,
   proxy: '',
+  autoLive: true,
   items: {now: [], dream: []}
 });
 let S = (() => {
@@ -63,6 +64,7 @@ let S = (() => {
       sort: raw.sort || d.sort,
       ordFilter: raw.ordFilter || 0,
       proxy: typeof raw.proxy === 'string' ? raw.proxy : '',
+      autoLive: raw.autoLive !== false,
       items: {now: raw.items?.now || [], dream: raw.items?.dream || []}
     };
   } catch (e) { return defaults(); }
@@ -111,6 +113,25 @@ function fromDisp(v) {
   const n = parseFloat(String(v).replace(',', '.'));
   return isFinite(n) ? n / r : 0;
 }
+
+/* "$1,234.56" / "128,24" -> число. Нужно для цен из текстовых прокси. */
+function parseUsd(s) {
+  if (s == null) return null;
+  const t = String(s).replace(/[^\d.,]/g, '');
+  if (!t) return null;
+  const dec = Math.max(t.lastIndexOf('.'), t.lastIndexOf(','));
+  let ip, fr;
+  if (dec < 0) {
+    ip = t; fr = '';
+  } else {
+    ip = t.slice(0, dec).replace(/[.,]/g, '');
+    fr = t.slice(dec + 1);
+  }
+  if (fr.length > 2) { ip = t.replace(/[.,]/g, ''); fr = ''; }
+  const v = parseFloat(ip + (fr ? '.' + fr : ''));
+  return isFinite(v) ? v : null;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------- нормализация поиска (рус/англ + транслит) ---------- */
 const TR = {а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',
@@ -244,9 +265,71 @@ function hashName(it) {
 }
 
 /* ---------- живые цены ----------
-   Сборщик: worker/worker.js (облако, для телефона) или tools/price_proxy.py (локально).
+   Основной путь без настройки: публичный прокси r.jina.ai читает priceoverview Steam.
+   Он отдаёт CORS-заголовок, поэтому работает прямо из браузера телефона.
+   Необязательный ускоритель: worker/worker.js или tools/price_proxy.py —
    API одинаковый: POST {names:[...]} -> {items:{name:{price}}}. */
 function proxyBase() { return String(S.proxy || '').trim().replace(/\/+$/, ''); }
+
+const JINA = 'https://r.jina.ai/';
+const JINA_MAX = 18;        // запас от лимита 20 запросов
+const JINA_WIN = 60000;     // в минуту
+let jinaHits = [];
+async function jinaSlot() {
+  for (;;) {
+    const now = Date.now();
+    jinaHits = jinaHits.filter(t => now - t < JINA_WIN);
+    if (jinaHits.length < JINA_MAX) { jinaHits.push(now); return; }
+    await sleep(jinaHits[0] + JINA_WIN - now + 200);
+  }
+}
+function steamPriceUrl(name) {
+  // двойное кодирование: r.jina.ai один раз раскодирует URL, иначе "&" в имени
+  // (например "Dreams & Nightmares Case") рвёт строку запроса и Steam отвечает без цены
+  return 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=' +
+    encodeURIComponent(encodeURIComponent(name));
+}
+async function jinaOnce(name) {
+  await jinaSlot();
+  const r = await fetch(JINA + steamPriceUrl(name), {cache: 'no-store'});
+  if (r.status === 429 || r.status === 503) { const e = new Error('лимит'); e.retry = true; throw e; }
+  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.retry = r.status >= 500; throw e; }
+  const txt = await r.text();
+  const lo = /"lowest_price"\s*:\s*"([^"]*)"/.exec(txt);
+  const md = /"median_price"\s*:\s*"([^"]*)"/.exec(txt);
+  const v = lo ? parseUsd(lo[1]) : (md ? parseUsd(md[1]) : null);
+  return v;
+}
+async function jinaOne(name) {
+  for (let k = 0; ; k++) {
+    try {
+      return await jinaOnce(name);
+    } catch (e) {
+      if (k >= 2 || (!e.retry && !/fetch|network|Failed/i.test(e.message))) throw e;
+      await sleep(1500 + k * 2000);
+    }
+  }
+}
+async function jinaBulk(items, onProgress) {
+  const names = [...new Set(items.map(hashName))];
+  const out = {};
+  const queue = names.map((_, i) => i);
+  let done = 0, bad = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = queue.shift();
+      if (i == null) return;
+      try {
+        const p = await jinaOne(names[i]);
+        if (p != null) out[names[i]] = {price: p};
+      } catch (e) { bad++; }
+      done++;
+      if (onProgress) onProgress(done, names.length, bad);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  return out;
+}
 function isLive(it) {
   if (it.live == null) return false;
   const t = Date.parse(it.liveTs || '');
@@ -254,10 +337,14 @@ function isLive(it) {
   const g = CAT && CAT.generated ? Date.parse(CAT.generated) : 0;
   return !(isFinite(g) && g > t);
 }
-async function liveBulk(items) {
+async function liveBulk(items, onProgress) {
   const base = proxyBase();
-  if (!base) throw new Error('сборщик не настроен');
   const names = [...new Set(items.map(hashName))];
+  if (!base) {
+    const map = await jinaBulk(items, onProgress);
+    if (!Object.keys(map).length) throw new Error('Steam не отдал цены — попробуй ещё раз через минуту');
+    return map;
+  }
   const r = await fetch(base + '/bulk', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -277,20 +364,51 @@ function applyLive(items, map) {
   }
   return n;
 }
-async function refreshLive(scope) {
-  const list = scope || tabItems();
-  if (!list.length) { toast('нечего обновлять'); return; }
-  if (!proxyBase()) { toast('сначала укажи сборщик в настройках'); return; }
+async function refreshLive(quiet) {
+  const list = tabItems();
+  if (!list.length) { if (!quiet) toast('нечего обновлять'); return; }
+  const btn = $('[data-live]');
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  if (!quiet) toast('обновляю цены: ' + list.length + '…');
+  try {
+    const map = await liveBulk(list, (d, n) => {
+      if (n > 3) toast('цены: ' + d + ' из ' + n + '…');
+    });
+    const cnt = applyLive(list, map);
+    save(); render();
+    toast(cnt ? 'цены обновлены: ' + cnt : 'лотов не нашлось');
+    return cnt;
+  } catch (e) {
+    if (!quiet) toast('ошибка: ' + e.message);
+    return 0;
+  } finally {
+    const b = $('[data-live]');
+    if (b) { b.disabled = false; b.classList.remove('busy'); }
+  }
+}
+function staleLive(items, ms) {
+  const now = Date.now();
+  return items.filter(it => {
+    if (!it.live) return true;
+    const t = Date.parse(it.liveTs || '');
+    return !isFinite(t) || now - t > ms;
+  });
+}
+async function autoLive() {
+  if (S.autoLive === false) return;
+  const list = staleLive(tabItems(), 6 * 3600e3);
+  if (!list.length) return;
   const btn = $('[data-live]');
   if (btn) { btn.disabled = true; btn.classList.add('busy'); }
   toast('обновляю цены: ' + list.length + '…');
   try {
-    const map = await liveBulk(list);
-    const n = applyLive(list, map);
-    save(); render();
-    toast(n ? 'цены обновлены: ' + n : 'лотов не нашлось');
+    const map = await liveBulk(list, (d, n) => {
+      if (n > 3) toast('цены: ' + d + ' из ' + n + '…');
+    });
+    const cnt = applyLive(list, map);
+    if (cnt) { save(); render(); toast('цены обновлены: ' + cnt); }
   } catch (e) {
-    toast('ошибка: ' + e.message);
+    /* тихо: снимок каталога остаётся на месте */
   } finally {
     const b = $('[data-live]');
     if (b) { b.disabled = false; b.classList.remove('busy'); }
@@ -299,7 +417,6 @@ async function refreshLive(scope) {
 async function refreshOne(id) {
   const it = findItem(id);
   if (!it) return;
-  if (!proxyBase()) { toast('сборщик не настроен'); return; }
   toast('запрашиваю цену…');
   try {
     const map = await liveBulk([it]);
@@ -444,9 +561,7 @@ function toolsHTML() {
     h += `<div class="seg tiny">${[0, 1, 2].map(n =>
       `<button data-ord="${n}" class="${S.ordFilter === n ? 'on' : ''}">${n ? n + '-й' : 'все'}</button>`).join('')}</div>`;
   }
-  if (proxyBase()) {
-    h += `<button class="livebtn" data-live title="обновить цены с ТП">⟳ цены</button>`;
-  }
+  h += `<button class="livebtn" data-live title="обновить цены с ТП">⟳ цены</button>`;
   return h + '</div>';
 }
 
@@ -745,11 +860,15 @@ function openSettings() {
       <input type="number" inputmode="decimal" data-rate="rub" value="${S.rate.rub}"></div>
     <div class="setrow"><div class="sl">1 $ в тенге<i>курс для пересчёта</i></div>
       <input type="number" inputmode="decimal" data-rate="kzt" value="${S.rate.kzt}"></div>
-    <div class="setrow"><div class="sl">Сборщик цен<i>Worker или локальный прокси</i></div>
-      <input type="url" data-proxy value="${esc(S.proxy)}" placeholder="https://…workers.dev"></div>
+    <div class="setrow"><div class="sl">Сборщик цен<i>необязательно · для скорости и батча</i></div>
+      <input type="url" data-proxy value="${esc(S.proxy)}" placeholder="пусто = Steam через прокси"></div>
     <div class="btnrow">
       <button data-act="test-proxy">Проверить сборщик</button>
     </div>
+    <label class="setrow" style="cursor:pointer">
+      <div class="sl">Обновлять цены при открытии<i>автоматически, если старше 6 часов</i></div>
+      <input type="checkbox" data-autolive ${S.autoLive === false ? '' : 'checked'}>
+    </label>
     <div class="btnrow" style="margin-top:14px">
       <button data-act="export">Экспорт</button>
       <button data-act="import">Импорт</button>
@@ -764,7 +883,9 @@ function openSettings() {
       суммы мечты.<br>
       База: <b>${CAT ? CAT.count.toLocaleString('ru-RU') : 0}</b> предметов,
       снимок ${CAT ? new Date(CAT.generated).toLocaleString('ru-RU') : '—'}.<br>
-      Источник: ${esc(CAT ? CAT.source : '—')}. Обновляется на GitHub раз в сутки.
+      Источник: ${esc(CAT ? CAT.source : '—')}. Обновляется на GitHub раз в сутки.<br>
+      Живые цены: Steam через публичный прокси, до 20 запросов в минуту.
+      Сборщик в поле выше не обязателен — он лишь снимает лимит и ускоряет.
     </div>
   `);
 }
@@ -923,7 +1044,13 @@ sheet.addEventListener('click', e => {
     }
     if (a === 'test-proxy') {
       const base = proxyBase();
-      if (!base) { toast('сначала укажи адрес сборщика'); return; }
+      if (!base) {
+        toast('проверяю Steam через прокси…');
+        jinaOne('Dreams & Nightmares Case')
+          .then(p => toast(p != null ? 'работает: кейс $' + p.toFixed(2) : 'ответ без цены, попробуй позже'))
+          .catch(e => toast('не отвечает: ' + e.message));
+        return;
+      }
       toast('проверяю сборщик…');
       fetch(base + '/', {cache: 'no-store'})
         .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
@@ -949,6 +1076,10 @@ sheet.addEventListener('change', e => {
   if (t.dataset.proxy !== undefined) {
     S.proxy = t.value.trim().replace(/\/+$/, '');
     save(); render();
+  }
+  if (t.dataset.autolive !== undefined) {
+    S.autoLive = !!t.checked;
+    save();
   }
 });
 
@@ -999,6 +1130,7 @@ async function boot() {
   render();
   $('#boot').classList.add('off');
   setTimeout(() => { const b = $('#boot'); if (b) b.remove(); }, 500);
+  setTimeout(() => { autoLive(); }, 800);
 }
 
 boot();
