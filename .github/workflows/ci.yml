@@ -1,0 +1,40 @@
+name: ci
+
+# Раньше здесь раз в сутки пересобиралась база цен из агрегатора.
+# Агрегатор (prices.csgotrader.app) снят, а Steam отдаёт 429 на TLS Python
+# и на серверные IP — поэтому ежедневная сборка цен в Actions потеряла смысл.
+# Живые цены теперь берёт worker/worker.js (Cloudflare, бесплатно) по запросу
+# со страницы: 10-50 запросов вместо 19 000.
+# Здесь осталась только проверка, что база и файлы целы.
+
+on:
+  push:
+    paths:
+      - "data/catalog.json"
+      - "app.js"
+      - "index.html"
+      - "style.css"
+      - "tools/**"
+      - "worker/**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Проверить каталог
+        run: python tools/build.py --check --out data/catalog.json
+
+      - name: Проверить, что файлы на месте
+        run: |
+          for f in index.html style.css app.js data/catalog.json; do
+            test -s "$f" || { echo "нет или пуст: $f"; exit 1; }
+          done
+          echo "ок"

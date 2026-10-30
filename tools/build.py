@@ -210,6 +210,40 @@ def load_meta(path):
         return {}
 
 
+def check_catalog(path):
+    """Проверка готового каталога — используется в CI."""
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    items = d.get("items") or {}
+    priced = bad = 0
+    for base, e in items.items():
+        p = e.get("p") or {}
+        ok = 0
+        for q in ("n", "s", "v"):
+            arr = p.get(q) or []
+            if len(arr) > 5:
+                bad += 1
+            for v in arr:
+                if v is None:
+                    continue
+                if not isinstance(v, (int, float)) or v <= 0:
+                    bad += 1
+                else:
+                    ok += 1
+        if ok:
+            priced += 1
+    print("предметов: %d, с ценами: %d, ошибок: %d, снимок: %s"
+          % (len(items), priced, bad, d.get("generated", "-")))
+    if len(items) < 3000:
+        print("ОШИБКА: в базе меньше 3000 предметов")
+        return 2
+    if bad:
+        print("ОШИБКА: некорректные цены")
+        return 3
+    print("ок")
+    return 0
+
+
 def main(argv=None):
     try:  # консоль Windows любит cp1251/cp866
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -221,7 +255,12 @@ def main(argv=None):
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--keep-meta", default=None,
                     help="каталог, из которого взять иконки (по умолчанию --out)")
+    ap.add_argument("--check", action="store_true",
+                    help="только проверить готовый каталог и выйти")
     a = ap.parse_args(argv)
+
+    if a.check:
+        return check_catalog(a.out)
 
     if not a.sqlite and not a.feed:
         ap.error("нужен --sqlite или --feed")

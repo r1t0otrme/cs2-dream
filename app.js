@@ -48,6 +48,7 @@ const defaults = () => ({
   rate: {rub: 92, kzt: 520},
   sort: 'price-desc',
   ordFilter: 0,
+  proxy: '',
   items: {now: [], dream: []}
 });
 let S = (() => {
@@ -61,6 +62,7 @@ let S = (() => {
       rate: Object.assign(d.rate, raw.rate || {}),
       sort: raw.sort || d.sort,
       ordFilter: raw.ordFilter || 0,
+      proxy: typeof raw.proxy === 'string' ? raw.proxy : '',
       items: {now: raw.items?.now || [], dream: raw.items?.dream || []}
     };
   } catch (e) { return defaults(); }
@@ -226,16 +228,93 @@ function qualHas(c, q) {
 }
 function itemPrice(it) {
   const c = CAT && CAT.items[it.base];
+  let catP = null;
   if (c) {
-    const p = priceOf(c, it.q, it.w);
-    if (p != null) { it.snap = p; it.ts = CAT.generated; return p; }
+    catP = priceOf(c, it.q, it.w);
+    if (catP != null) { it.snap = catP; it.ts = CAT.generated; }
   }
-  return it.snap == null ? null : it.snap;
+  // живая цена со сборщика свежее снимка каталога - берём её
+  if (isLive(it)) return it.live;
+  return catP != null ? catP : (it.snap == null ? null : it.snap);
 }
 function hashName(it) {
   const qp = it.q === 's' ? 'StatTrak™ ' : it.q === 'v' ? 'Souvenir ' : '';
   const w = it.w == null ? '' : ' (' + WEARS[it.w].en + ')';
   return qp + it.base + w;
+}
+
+/* ---------- живые цены ----------
+   Сборщик: worker/worker.js (облако, для телефона) или tools/price_proxy.py (локально).
+   API одинаковый: POST {names:[...]} -> {items:{name:{price}}}. */
+function proxyBase() { return String(S.proxy || '').trim().replace(/\/+$/, ''); }
+function isLive(it) {
+  if (it.live == null) return false;
+  const t = Date.parse(it.liveTs || '');
+  if (!isFinite(t)) return false;
+  const g = CAT && CAT.generated ? Date.parse(CAT.generated) : 0;
+  return !(isFinite(g) && g > t);
+}
+async function liveBulk(items) {
+  const base = proxyBase();
+  if (!base) throw new Error('сборщик не настроен');
+  const names = [...new Set(items.map(hashName))];
+  const r = await fetch(base + '/bulk', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({names, cur: 1})
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+  if (!d || !d.items) throw new Error('плохой ответ сборщика');
+  return d.items;
+}
+function applyLive(items, map) {
+  const ts = new Date().toISOString();
+  let n = 0;
+  for (const it of items) {
+    const row = map[hashName(it)];
+    if (row && row.price != null) { it.live = row.price; it.liveTs = ts; n++; }
+  }
+  return n;
+}
+async function refreshLive(scope) {
+  const list = scope || tabItems();
+  if (!list.length) { toast('нечего обновлять'); return; }
+  if (!proxyBase()) { toast('сначала укажи сборщик в настройках'); return; }
+  const btn = $('[data-live]');
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  toast('обновляю цены: ' + list.length + '…');
+  try {
+    const map = await liveBulk(list);
+    const n = applyLive(list, map);
+    save(); render();
+    toast(n ? 'цены обновлены: ' + n : 'лотов не нашлось');
+  } catch (e) {
+    toast('ошибка: ' + e.message);
+  } finally {
+    const b = $('[data-live]');
+    if (b) { b.disabled = false; b.classList.remove('busy'); }
+  }
+}
+async function refreshOne(id) {
+  const it = findItem(id);
+  if (!it) return;
+  if (!proxyBase()) { toast('сборщик не настроен'); return; }
+  toast('запрашиваю цену…');
+  try {
+    const map = await liveBulk([it]);
+    const row = map[hashName(it)];
+    if (row && row.price != null) {
+      it.live = row.price;
+      it.liveTs = new Date().toISOString();
+      save(); render(); openItem(id);
+      toast('цена обновлена');
+    } else {
+      toast('на ТП нет лотов');
+    }
+  } catch (e) {
+    toast('ошибка: ' + e.message);
+  }
 }
 
 function parseQuery(raw) {
@@ -365,6 +444,9 @@ function toolsHTML() {
     h += `<div class="seg tiny">${[0, 1, 2].map(n =>
       `<button data-ord="${n}" class="${S.ordFilter === n ? 'on' : ''}">${n ? n + '-й' : 'все'}</button>`).join('')}</div>`;
   }
+  if (proxyBase()) {
+    h += `<button class="livebtn" data-live title="обновить цены с ТП">⟳ цены</button>`;
+  }
   return h + '</div>';
 }
 
@@ -381,7 +463,7 @@ function cardHTML(it) {
     </div>
     <div class="cbody">
       <div class="cname">${esc(it.base)}</div>
-      <div class="cprice mono ${p == null ? 'none' : ''}">${p == null ? 'нет цены' : money(p)}</div>
+      <div class="cprice mono ${p == null ? 'none' : ''}">${p == null ? 'нет цены' : money(p)}${isLive(it) ? '<i class="livedot" title="живая цена с ТП"></i>' : ''}</div>
     </div>
   </div>`;
 }
@@ -617,7 +699,7 @@ function openItem(id) {
       ${c.i ? `<img src="${IMG(c.i)}" alt="">` : '<span class="noimg">◈</span>'}
     </div>
     <div class="pricebig"><b class="mono">${p == null ? '—' : money(p)}</b>
-      <span>${p == null ? 'нет цен' : 'на ТП Steam'}</span></div>
+      <span>${p == null ? 'нет цен' : (isLive(it) ? 'живая цена' : 'на ТП Steam')}</span></div>
     ${S.items.dream.includes(it) ? `<div class="seg small" data-order-seg>
       <button data-set-order="0" class="${!it.order ? 'on' : ''}">без порядка</button>
       <button data-set-order="1" class="${it.order === 1 ? 'on' : ''}" style="color:${ORD_COLOR[1]}">1-й</button>
@@ -625,6 +707,7 @@ function openItem(id) {
     </div>` : ''}
     ${priceTableHTML(c, it)}
     <div class="btnrow">
+      <button data-live-one="${it.id}">⟳ Обновить цену</button>
       <button data-edit="${it.id}">Изменить качество</button>
       <button data-market="${esc(hashName(it))}">Открыть на ТП</button>
       <button class="danger" data-del="${it.id}">Удалить</button>
@@ -662,6 +745,11 @@ function openSettings() {
       <input type="number" inputmode="decimal" data-rate="rub" value="${S.rate.rub}"></div>
     <div class="setrow"><div class="sl">1 $ в тенге<i>курс для пересчёта</i></div>
       <input type="number" inputmode="decimal" data-rate="kzt" value="${S.rate.kzt}"></div>
+    <div class="setrow"><div class="sl">Сборщик цен<i>Worker или локальный прокси</i></div>
+      <input type="url" data-proxy value="${esc(S.proxy)}" placeholder="https://…workers.dev"></div>
+    <div class="btnrow">
+      <button data-act="test-proxy">Проверить сборщик</button>
+    </div>
     <div class="btnrow" style="margin-top:14px">
       <button data-act="export">Экспорт</button>
       <button data-act="import">Импорт</button>
@@ -683,7 +771,7 @@ function openSettings() {
 
 /* ------------------------------------------------------------------ экспорт/импорт */
 function exportData() {
-  const txt = JSON.stringify({v: 2, cur: S.cur, rate: S.rate, items: S.items}, null, 1);
+  const txt = JSON.stringify({v: 2, cur: S.cur, rate: S.rate, proxy: S.proxy, items: S.items}, null, 1);
   const box = $('#io');
   box.innerHTML = `<div class="setrow"><div class="sl">скопируй или сохрани файл</div></div>
     <textarea class="settxt" readonly>${esc(txt)}</textarea>
@@ -704,6 +792,7 @@ function applyImport() {
     S.items = {now: d.items.now || [], dream: d.items.dream || []};
     if (d.cur && CURS[d.cur]) S.cur = d.cur;
     if (d.rate) S.rate = Object.assign(S.rate, d.rate);
+    if (d.proxy !== undefined) S.proxy = String(d.proxy || '');
     save(); render(); closeSheet(); toast('импортировано');
   } catch (e) { toast('не получилось: ' + e.message); }
 }
@@ -736,7 +825,8 @@ $('#bars').addEventListener('click', e => {
   const s = e.target.closest('[data-sort]');
   if (s) { S.sort = s.dataset.sort; save(); render(); return; }
   const o = e.target.closest('[data-ord]');
-  if (o) { S.ordFilter = +o.dataset.ord; save(); render(); }
+  if (o) { S.ordFilter = +o.dataset.ord; save(); render(); return; }
+  if (e.target.closest('[data-live]')) { refreshLive(); }
 });
 
 /* шторка: делегирование */
@@ -794,6 +884,9 @@ sheet.addEventListener('click', e => {
   const mk = t.closest('[data-market]');
   if (mk) { window.open(MARKET_URL(mk.dataset.market), '_blank', 'noopener'); return; }
 
+  const lo = t.closest('[data-live-one]');
+  if (lo) { refreshOne(lo.dataset.liveOne); return; }
+
   const dl = t.closest('[data-del]');
   if (dl) {
     const id = dl.dataset.del;
@@ -828,6 +921,16 @@ sheet.addEventListener('click', e => {
       setTimeout(() => URL.revokeObjectURL(a2.href), 3000);
       return;
     }
+    if (a === 'test-proxy') {
+      const base = proxyBase();
+      if (!base) { toast('сначала укажи адрес сборщика'); return; }
+      toast('проверяю сборщик…');
+      fetch(base + '/', {cache: 'no-store'})
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+        .then(d => toast(d && d.ok ? 'сборщик на связи' : 'странный ответ'))
+        .catch(e => toast('не отвечает: ' + e.message));
+      return;
+    }
     if (a === 'clear-now' && confirm('Очистить инвентарь «Сейчас»?')) {
       S.items.now = []; save(); render(); closeSheet(); toast('очищено'); return;
     }
@@ -842,6 +945,10 @@ sheet.addEventListener('change', e => {
   if (t.dataset.rate) {
     const v = parseFloat(t.value);
     if (isFinite(v) && v > 0) { S.rate[t.dataset.rate] = v; save(); render(); }
+  }
+  if (t.dataset.proxy !== undefined) {
+    S.proxy = t.value.trim().replace(/\/+$/, '');
+    save(); render();
   }
 });
 
