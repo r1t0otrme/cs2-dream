@@ -493,6 +493,20 @@ $('#download').addEventListener('click', async () => {
     ? ' · собрано ' + new Date(live.generated).toLocaleString('ru-RU') : '') +
     ' · в инвентаре: ' + appInventory().length);
 })();
+
+/* локальный конфиг (collect.config.json рядом с файлами): токен уже внутри */
+(async () => {
+  try {
+    const r = await fetch('collect.config.json', {cache: 'no-store'});
+    if (!r.ok) return;
+    const loc = await r.json();
+    if (loc.token) { cfg.token = String(loc.token).trim(); $('#token').value = cfg.token; }
+    if (loc.repo) { cfg.repo = loc.repo; $('#repo').value = cfg.repo; }
+    if (loc.branch) { cfg.branch = loc.branch; $('#branch').value = cfg.branch; }
+    if (loc.rate) { cfg.rate = String(loc.rate); $('#rate').value = cfg.rate; }
+    log('токен подставлен автоматически — можно сразу вставлять HTML', 'ok');
+  } catch (e) { /* на GitHub Pages файла нет, и это нормально */ }
+})();
 </script>
 </body>
 </html>
