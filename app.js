@@ -50,6 +50,7 @@ const defaults = () => ({
   ordFilter: 0,
   proxy: '',
   autoLive: true,
+  live: {},
   items: {now: [], dream: []}
 });
 let S = (() => {
@@ -65,6 +66,7 @@ let S = (() => {
       ordFilter: raw.ordFilter || 0,
       proxy: typeof raw.proxy === 'string' ? raw.proxy : '',
       autoLive: raw.autoLive !== false,
+      live: (raw.live && typeof raw.live === 'object') ? raw.live : {},
       items: {now: raw.items?.now || [], dream: raw.items?.dream || []}
     };
   } catch (e) { return defaults(); }
@@ -254,8 +256,9 @@ function itemPrice(it) {
     catP = priceOf(c, it.q, it.w);
     if (catP != null) { it.snap = catP; it.ts = CAT.generated; }
   }
-  // живая цена со сборщика свежее снимка каталога - берём её
-  if (isLive(it)) return it.live;
+  // живая цена с ТП свежее снимка каталога - берём её
+  const live = liveGet(hashName(it));
+  if (live != null) return live;
   return catP != null ? catP : (it.snap == null ? null : it.snap);
 }
 function hashName(it) {
@@ -330,12 +333,49 @@ async function jinaBulk(items, onProgress) {
   await Promise.all([worker(), worker(), worker()]);
   return out;
 }
-function isLive(it) {
-  if (it.live == null) return false;
-  const t = Date.parse(it.liveTs || '');
-  if (!isFinite(t)) return false;
+/* живые цены хранятся по market_hash_name: { "AK-47 | Redline (Field-Tested)": [31.55, "iso"] } */
+function liveGet(name) {
+  const row = S.live && S.live[name];
+  if (!row || row[0] == null) return null;
+  const t = Date.parse(row[1]);
+  if (!isFinite(t)) return null;
   const g = CAT && CAT.generated ? Date.parse(CAT.generated) : 0;
-  return !(isFinite(g) && g > t);
+  return isFinite(g) && g > t ? null : row[0];
+}
+function liveTs(name) {
+  const row = S.live && S.live[name];
+  return row ? row[1] : null;
+}
+function liveSet(name, price) {
+  if (!S.live) S.live = {};
+  S.live[name] = [price, new Date().toISOString()];
+}
+function isLive(it) { return liveGet(hashName(it)) != null; }
+
+/* готовая база цен из репозитория: её наполняет collect.html */
+async function loadLive() {
+  const urls = [
+    'https://raw.githubusercontent.com/r1t0otrme/cs2-dream/main/data/live.json?t=' + Date.now(),
+    'data/live.json?t=' + Date.now()
+  ];
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, {cache: 'no-store'});
+      if (!r.ok) continue;
+      const d = await r.json();
+      const prices = (d && d.prices) || {};
+      let n = 0;
+      for (const name of Object.keys(prices)) {
+        const row = prices[name];
+        if (!Array.isArray(row) || row[0] == null) continue;
+        const cur = S.live[name];
+        if (!cur || String(row[1]) > String(cur[1])) { S.live[name] = [row[0], row[1]]; n++; }
+      }
+      if (n) save();
+      return n;
+    } catch (e) { /* пробуем следующий источник */ }
+  }
+  return 0;
 }
 async function liveBulk(items, onProgress) {
   const base = proxyBase();
@@ -356,11 +396,16 @@ async function liveBulk(items, onProgress) {
   return d.items;
 }
 function applyLive(items, map) {
-  const ts = new Date().toISOString();
   let n = 0;
   for (const it of items) {
-    const row = map[hashName(it)];
-    if (row && row.price != null) { it.live = row.price; it.liveTs = ts; n++; }
+    const name = hashName(it);
+    const row = map[name];
+    if (row && row.price != null) {
+      liveSet(name, row.price);
+      it.live = row.price;
+      it.liveTs = S.live[name][1];
+      n++;
+    }
   }
   return n;
 }
@@ -389,8 +434,9 @@ async function refreshLive(quiet) {
 function staleLive(items, ms) {
   const now = Date.now();
   return items.filter(it => {
-    if (!it.live) return true;
-    const t = Date.parse(it.liveTs || '');
+    const name = hashName(it);
+    if (liveGet(name) == null) return true;
+    const t = Date.parse(liveTs(name) || '');
     return !isFinite(t) || now - t > ms;
   });
 }
@@ -414,21 +460,67 @@ async function autoLive() {
     if (b) { b.disabled = false; b.classList.remove('busy'); }
   }
 }
-async function refreshOne(id) {
+const LIVE_BUSY = new Set();
+async function refreshOne(id, quiet) {
   const it = findItem(id);
-  if (!it) return;
-  toast('запрашиваю цену…');
+  if (!it) return false;
+  const name = hashName(it);
+  if (LIVE_BUSY.has(name)) return false;
+  LIVE_BUSY.add(name);
+  if (!quiet) toast('запрашиваю цену…');
   try {
     const map = await liveBulk([it]);
-    const row = map[hashName(it)];
+    const row = map[name];
     if (row && row.price != null) {
+      liveSet(name, row.price);
       it.live = row.price;
-      it.liveTs = new Date().toISOString();
-      save(); render(); openItem(id);
-      toast('цена обновлена');
-    } else {
-      toast('на ТП нет лотов');
+      it.liveTs = S.live[name][1];
+      save(); render();
+      if (currentItemId === id) openItem(id);
+      if (!quiet) toast('цена обновлена');
+      return true;
     }
+    if (!quiet) toast('на ТП нет лотов');
+    return false;
+  } catch (e) {
+    if (!quiet) toast('ошибка: ' + e.message);
+    return false;
+  } finally {
+    LIVE_BUSY.delete(name);
+  }
+}
+/* догрузить живые цены на все износы/качества открытого скина */
+async function refreshWears(baseId) {
+  const it = findItem(baseId);
+  if (!it) return;
+  const c = CAT.items[it.base];
+  if (!c) return;
+  const list = [];
+  if (c.w) {
+    for (const q of ['n', 's', 'v']) {
+      if (!qualHas(c, q)) continue;
+      WEARS.forEach((w, i) => {
+        list.push({base: it.base, q, w: i});
+      });
+    }
+  } else {
+    for (const q of ['n', 's', 'v']) {
+      if (qualHas(c, q)) list.push({base: it.base, q, w: null});
+    }
+  }
+  const names = [...new Set(list.map(hashName))];
+  toast('цены по износам: ' + names.length + ' запросов…');
+  try {
+    const map = await liveBulk(list, (d, n) => {
+      if (n > 3) toast('износы: ' + d + ' из ' + n + '…');
+    });
+    let n = 0;
+    for (const [name, row] of Object.entries(map)) {
+      if (row && row.price != null) { liveSet(name, row.price); n++; }
+    }
+    save(); render();
+    if (currentItemId === baseId) openItem(baseId);
+    toast(n ? 'обновлено износов: ' + n : 'лотов не нашлось');
   } catch (e) {
     toast('ошибка: ' + e.message);
   }
@@ -821,6 +913,10 @@ function openItem(id) {
       <button data-set-order="2" class="${it.order === 2 ? 'on' : ''}" style="color:${ORD_COLOR[2]}">2-й</button>
     </div>` : ''}
     ${priceTableHTML(c, it)}
+    ${c.w ? `<div class="ptable-foot">
+      <span>${liveWears(c, it) ? 'зелёная точка — живая цена ТП' : 'цены из снимка каталога'}</span>
+      <button class="livebtn" data-live-all="${it.id}">⟳ все износы</button>
+    </div>` : ''}
     <div class="btnrow">
       <button data-live-one="${it.id}">⟳ Обновить цену</button>
       <button data-edit="${it.id}">Изменить качество</button>
@@ -828,21 +924,35 @@ function openItem(id) {
       <button class="danger" data-del="${it.id}">Удалить</button>
     </div>
   `);
+  // цену текущего варианта подтягиваем сами, если она старая
+  if (!isLive(it)) setTimeout(() => refreshOne(id, true), 250);
+}
+function liveWears(c, it) {
+  if (!c.w) return false;
+  for (const q of ['n', 's', 'v']) {
+    if (!qualHas(c, q)) continue;
+    for (let i = 0; i < 5; i++) if (liveGet(hashName({base: it.base, q, w: i})) != null) return true;
+  }
+  return false;
 }
 function priceTableHTML(c, it) {
   if (!c.w) return '';
   const cols = QUALS.filter(q => qualHas(c, q.k));
   if (!cols.length) return '';
+  const rows = WEARS.map((w, i) => {
+    const cells = cols.map(q => {
+      const name = hashName({base: it.base, q: q.k, w: i});
+      const lv = liveGet(name);
+      const v = lv != null ? lv : priceOf(c, q.k, i);
+      const on = it.w === i && it.q === q.k;
+      const cls = [v == null ? 'na' : '', lv != null ? 'lv' : '', on ? 'cur' : ''].filter(Boolean).join(' ');
+      return `<td class="${cls}">${v == null ? '—' : money(v)}${lv != null ? '<i class="livedot"></i>' : ''}</td>`;
+    }).join('');
+    return `<tr><td>${w.code}</td>${cells}</tr>`;
+  }).join('');
   return `<table class="ptable">
     <thead><tr><th></th>${cols.map(q => `<th>${q.short}</th>`).join('')}</tr></thead>
-    <tbody>${WEARS.map((w, i) => {
-      const cells = cols.map(q => {
-        const v = priceOf(c, q.k, i);
-        const on = it && it.w === i && it.q === q.k;
-        return `<td class="${v == null ? 'na' : ''}" ${on ? 'style="color:var(--gold);font-weight:800"' : ''}>${v == null ? '—' : money(v)}</td>`;
-      }).join('');
-      return `<tr><td>${w.code}</td>${cells}</tr>`;
-    }).join('')}</tbody>
+    <tbody>${rows}</tbody>
   </table>`;
 }
 
@@ -870,6 +980,7 @@ function openSettings() {
       <input type="checkbox" data-autolive ${S.autoLive === false ? '' : 'checked'}>
     </label>
     <div class="btnrow" style="margin-top:14px">
+      <button data-act="collect">⟳ Сборщик цен</button>
       <button data-act="export">Экспорт</button>
       <button data-act="import">Импорт</button>
     </div>
@@ -1008,6 +1119,9 @@ sheet.addEventListener('click', e => {
   const lo = t.closest('[data-live-one]');
   if (lo) { refreshOne(lo.dataset.liveOne); return; }
 
+  const la = t.closest('[data-live-all]');
+  if (la) { refreshWears(la.dataset.liveAll); return; }
+
   const dl = t.closest('[data-del]');
   if (dl) {
     const id = dl.dataset.del;
@@ -1025,6 +1139,10 @@ sheet.addEventListener('click', e => {
   const act = t.closest('[data-act]');
   if (act) {
     const a = act.dataset.act;
+    if (a === 'collect') {
+      window.open('collect.html', '_blank', 'noopener');
+      return;
+    }
     if (a === 'export') return exportData();
     if (a === 'import') return importData();
     if (a === 'do-import') return applyImport();
@@ -1130,7 +1248,10 @@ async function boot() {
   render();
   $('#boot').classList.add('off');
   setTimeout(() => { const b = $('#boot'); if (b) b.remove(); }, 500);
-  setTimeout(() => { autoLive(); }, 800);
+  loadLive().then(n => {
+    if (n) { render(); toast('цены из базы: ' + n); }
+    setTimeout(() => { autoLive(); }, 400);
+  });
 }
 
 boot();
