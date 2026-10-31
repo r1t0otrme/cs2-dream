@@ -353,7 +353,9 @@ function liveSet(name, price) {
 function isLive(it) { return liveGet(hashName(it)) != null; }
 
 /* готовая база цен из репозитория: её наполняет collect.html */
+let lastLiveLoad = 0;
 async function loadLive() {
+  lastLiveLoad = Date.now();
   const urls = [
     'https://raw.githubusercontent.com/r1t0otrme/cs2-dream/main/data/live.json?t=' + Date.now(),
     'data/live.json?t=' + Date.now()
@@ -1251,6 +1253,14 @@ async function boot() {
   loadLive().then(n => {
     if (n) { render(); toast('цены из базы: ' + n); }
     setTimeout(() => { autoLive(); }, 400);
+  });
+
+  // вернулся на вкладку спустя время — проверяю, не появилось ли новых цен в базе
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') return;
+    if (Date.now() - lastLiveLoad < 3 * 60e3) return;
+    const n = await loadLive();
+    if (n) { render(); toast('цены из базы: ' + n); }
   });
 }
 
