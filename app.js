@@ -373,8 +373,21 @@ function isLive(it) { return liveGet(hashName(it)) != null; }
 
 /* готовая база цен из репозитория: её наполняет collect.html */
 let lastLiveLoad = 0;
+function mergeLiveDoc(d) {
+  const prices = (d && d.prices) || {};
+  let n = 0;
+  for (const name of Object.keys(prices)) {
+    const row = prices[name];
+    if (!Array.isArray(row) || row[0] == null) continue;
+    const cur = S.live[name];
+    if (!cur || String(row[1]) > String(cur[1])) { S.live[name] = [row[0], row[1]]; n++; }
+  }
+  return n;
+}
 async function loadLive() {
   lastLiveLoad = Date.now();
+  // в офлайн-сборке база вшита в файл
+  let n = window.__LIVE__ ? mergeLiveDoc(window.__LIVE__) : 0;
   const urls = [
     'https://raw.githubusercontent.com/r1t0otrme/cs2-dream/main/data/live.json?t=' + Date.now(),
     'data/live.json?t=' + Date.now()
@@ -383,20 +396,12 @@ async function loadLive() {
     try {
       const r = await fetch(u, {cache: 'no-store'});
       if (!r.ok) continue;
-      const d = await r.json();
-      const prices = (d && d.prices) || {};
-      let n = 0;
-      for (const name of Object.keys(prices)) {
-        const row = prices[name];
-        if (!Array.isArray(row) || row[0] == null) continue;
-        const cur = S.live[name];
-        if (!cur || String(row[1]) > String(cur[1])) { S.live[name] = [row[0], row[1]]; n++; }
-      }
-      if (n) save();
-      return n;
+      n += mergeLiveDoc(await r.json());
+      break;
     } catch (e) { /* пробуем следующий источник */ }
   }
-  return 0;
+  if (n) save();
+  return n;
 }
 async function liveBulk(items, onProgress) {
   const base = proxyBase();
@@ -1536,29 +1541,37 @@ function failBoot(title, sub) {
 
 async function boot() {
   try {
-    const res = await fetch('data/catalog.json', {cache: 'no-store'});
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const total = +(res.headers.get('content-length') || 0);
-    let buf = '';
-    if (res.body && total) {
-      const rd = res.body.getReader(), dec = new TextDecoder();
-      let got = 0;
-      for (;;) {
-        const {done, value} = await rd.read();
-        if (done) break;
-        got += value.length;
-        buf += dec.decode(value, {stream: true});
-        setBoot(8 + 84 * got / total, 'загружаю базу цен… ' + (got / 1048576).toFixed(1) + ' МБ');
-      }
-      buf += dec.decode();
+    if (window.__CATALOG__) {
+      // офлайн-сборка: база уже внутри html
+      setBoot(90, 'читаю встроенную базу…');
+      CAT = window.__CATALOG__;
+      buildIndex();
+      setBoot(100);
     } else {
-      setBoot(40, 'загружаю базу цен…');
-      buf = await res.text();
+      const res = await fetch('data/catalog.json', {cache: 'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const total = +(res.headers.get('content-length') || 0);
+      let buf = '';
+      if (res.body && total) {
+        const rd = res.body.getReader(), dec = new TextDecoder();
+        let got = 0;
+        for (;;) {
+          const {done, value} = await rd.read();
+          if (done) break;
+          got += value.length;
+          buf += dec.decode(value, {stream: true});
+          setBoot(8 + 84 * got / total, 'загружаю базу цен… ' + (got / 1048576).toFixed(1) + ' МБ');
+        }
+        buf += dec.decode();
+      } else {
+        setBoot(40, 'загружаю базу цен…');
+        buf = await res.text();
+      }
+      setBoot(94, 'разбираю…');
+      CAT = JSON.parse(buf);
+      buildIndex();
+      setBoot(100);
     }
-    setBoot(94, 'разбираю…');
-    CAT = JSON.parse(buf);
-    buildIndex();
-    setBoot(100);
   } catch (e) {
     failBoot('не удалось загрузить базу', esc(e.message));
     return;
