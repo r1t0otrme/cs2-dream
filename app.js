@@ -50,6 +50,10 @@ const defaults = () => ({
   ordFilter: 0,
   proxy: '',
   autoLive: true,
+  topUp: true,
+  help: 5,
+  ghToken: '',
+  shareAuto: true,
   live: {},
   items: {now: [], dream: []}
 });
@@ -66,6 +70,10 @@ let S = (() => {
       ordFilter: raw.ordFilter || 0,
       proxy: typeof raw.proxy === 'string' ? raw.proxy : '',
       autoLive: raw.autoLive !== false,
+      topUp: raw.topUp !== false,
+      help: isFinite(+raw.help) ? Math.max(0, Math.min(200, +raw.help)) : 5,
+      ghToken: typeof raw.ghToken === 'string' ? raw.ghToken : '',
+      shareAuto: raw.shareAuto !== false,
       live: (raw.live && typeof raw.live === 'object') ? raw.live : {},
       items: {now: raw.items?.now || [], dream: raw.items?.dream || []}
     };
@@ -528,6 +536,259 @@ async function refreshWears(baseId) {
   }
 }
 
+/* ---------- фоновый долив цен ----------
+   Человек платит запросами только за то, что нужно ему:
+   1) своё — предметы из обеих вкладок, у которых цена старше 6 часов;
+      дорогие первыми (сильнее всего влияют на проценты);
+   2) общее — маленькая квота самых старых цен (по умолчанию 5 за сеанс,
+      ставится 0). Это не прогон каталога: 13 925 предметов не качает никто.
+   Темп держит jinaSlot (18 в минуту), поэтому фон не ловит 429 и не мешает. */
+const LIVE_TTL = 6 * 3600e3;
+const TOPUP = {running: false, duty: 0, done: 0, total: 0, bad: new Set(), fails: 0};
+
+function myNames() {
+  const s = new Set();
+  for (const k of ['now', 'dream']) for (const it of S.items[k]) s.add(hashName(it));
+  return s;
+}
+
+function ownStale() {
+  const act = tabItems();
+  const other = S.tab === 'now' ? S.items.dream : S.items.now;
+  const seen = new Set(), out = [];
+  for (const it of [...act, ...other]) {
+    const name = hashName(it);
+    if (seen.has(name) || TOPUP.bad.has(name)) continue;
+    seen.add(name);
+    const ts = Date.parse(liveTs(name) || '');
+    if (liveGet(name) != null && isFinite(ts) && Date.now() - ts <= LIVE_TTL) continue;
+    out.push({name, price: itemPrice(it) || 0});
+  }
+  return out.sort((a, b) => b.price - a.price);
+}
+
+/* самые старые записи базы, которых нет в списках человека */
+function oldestStale(n) {
+  const mine = myNames(), now = Date.now(), rows = [];
+  for (const [name, row] of Object.entries(S.live || {})) {
+    if (mine.has(name) || TOPUP.bad.has(name)) continue;
+    const t = Date.parse(row && row[1]);
+    if (!isFinite(t) || now - t <= LIVE_TTL) continue;
+    rows.push({name, t});
+  }
+  rows.sort((a, b) => a.t - b.t);
+  return rows.slice(0, n).map(r => r.name);
+}
+
+function topUpProgress() {
+  const own = ownStale().length;
+  const left = Math.max(0, (S.help | 0) - TOPUP.duty);
+  TOPUP.total = TOPUP.done + own + (left ? oldestStale(left).length : 0);
+}
+
+/* цена одного имени: через сборщик, если задан, иначе через прокси */
+async function priceOne(name) {
+  const base = proxyBase();
+  if (!base) return await jinaOne(name);
+  const r = await fetch(base + '/bulk', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({names: [name], cur: 1})
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+  const row = d && d.items && d.items[name];
+  return row && row.price != null ? row.price : null;
+}
+
+/* ---------- общая база ----------
+   Бесплатные «хранилища без регистрации» к 2026 либо умерли, либо режут
+   запросы: kvdb требует email, jsonblob/extendsclass/paste.rs не отвечают,
+   ntfy и MQTT публичные брокеры недоступны. Зато GitHub уже есть, отдаёт
+   CORS и хранит data/live.json. Поэтому обмен идёт через репозиторий:
+   кто обновил цены и вписал свой токен — вливает их в базу, остальные
+   получают их при следующем открытии. Токен остаётся в этом браузере. */
+const REPO = 'r1t0otrme/cs2-dream';
+const BRANCH = 'main';
+const SHARE_KEY = 'cs2dream.share';
+
+function sharePending() {
+  try { return JSON.parse(localStorage.getItem(SHARE_KEY) || '[]'); } catch (e) { return []; }
+}
+/* очередь на отправку: копим всё, что обновили */
+function sharePush(name, price) {
+  try {
+    const q = sharePending();
+    q.push([name, price, Date.now()]);
+    localStorage.setItem(SHARE_KEY, JSON.stringify(q.slice(-500)));
+  } catch (e) { /* переполнение — не страшно */ }
+}
+function shareClear(upto) {
+  try {
+    localStorage.setItem(SHARE_KEY, JSON.stringify(sharePending().filter(r => (r[2] || 0) > upto)));
+  } catch (e) {}
+}
+function b64utf8(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+function unb64utf8(s) {
+  const bin = atob(String(s || '').replace(/\s/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+function downloadPack(prices) {
+  const blob = new Blob([JSON.stringify({generated: new Date().toISOString(), prices}, null, 0)],
+    {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'live.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+}
+
+let shareBusy = false;
+async function flushShare(quiet) {
+  if (shareBusy) return false;
+  const q = sharePending();
+  if (!q.length) {
+    if (!quiet) toast('нечем делиться — сначала обнови цены');
+    return false;
+  }
+  const fresh = {};
+  for (const row of q) {
+    const name = row[0], price = +row[1], ts = +row[2] || Date.now();
+    if (!name || !(price > 0) || !isFinite(price) || price > 1e6) continue;
+    const iso = new Date(ts).toISOString();
+    if (!fresh[name] || fresh[name][1] < iso) fresh[name] = [price, iso];
+  }
+  const names = Object.keys(fresh);
+  if (!names.length) { if (!quiet) toast('нечего отправлять'); return false; }
+
+  const token = String(S.ghToken || '').trim();
+  if (!token) {
+    downloadPack(fresh);
+    if (!quiet) toast('токена нет — скачал live.json, положи его в data/');
+    return false;
+  }
+
+  const cutoff = Date.now();
+  shareBusy = true;
+  if (!quiet) toast('отправляю в общую базу: ' + names.length + '…');
+  try {
+    const url = 'https://api.github.com/repos/' + REPO + '/contents/data/live.json';
+    const auth = {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json'};
+    let sha = null, prices = {};
+    const g = await fetch(url + '?ref=' + BRANCH, {headers: auth, cache: 'no-store'});
+    if (g.ok) {
+      const d = await g.json();
+      sha = d.sha;
+      try { prices = (JSON.parse(unb64utf8(d.content)) || {}).prices || {}; } catch (e) { prices = {}; }
+    } else if (g.status !== 404) {
+      throw new Error(g.status === 401 || g.status === 403 ? 'токен не подходит' : 'HTTP ' + g.status);
+    }
+    let added = 0;
+    for (const n of names) {
+      const cur = prices[n];
+      if (!cur || String(fresh[n][1]) > String(cur[1])) { prices[n] = fresh[n]; added++; }
+    }
+    if (!added) {
+      shareClear(cutoff);
+      if (!quiet) toast('в базе уже свежее — отправлять нечего');
+      return true;
+    }
+    const doc = {generated: new Date().toISOString(), prices};
+    const body = {
+      message: 'цены: +' + added + ' (в базе ' + Object.keys(prices).length + ')',
+      content: b64utf8(JSON.stringify(doc)),
+      branch: BRANCH
+    };
+    if (sha) body.sha = sha;
+    const w = await fetch(url, {
+      method: 'PUT',
+      headers: Object.assign({'Content-Type': 'application/json'}, auth),
+      body: JSON.stringify(body)
+    });
+    if (!w.ok) throw new Error(w.status === 409 ? 'кто-то успел раньше — попробуй ещё раз' : 'HTTP ' + w.status);
+    shareClear(cutoff);
+    if (!quiet) toast('в общей базе: +' + added + ' цен');
+    setTimeout(() => loadLive().then(n => { if (n) render(); }), 2000);
+    return true;
+  } catch (e) {
+    if (!quiet) toast('общая база: ' + e.message);
+    return false;
+  } finally {
+    shareBusy = false;
+  }
+}
+
+/* тихая отправка после долива: не чаще раза в 10 минут */
+function shareAuto() {
+  if (!S.shareAuto || !String(S.ghToken || '').trim()) return;
+  if (!sharePending().length) return;
+  const last = +localStorage.getItem('cs2dream.shareAt') || 0;
+  if (Date.now() - last < 20 * 60e3) return;
+  localStorage.setItem('cs2dream.shareAt', String(Date.now()));
+  flushShare(true);
+}
+
+async function topUpRun() {
+  if (TOPUP.running) return;
+  if (S.topUp === false && S.autoLive === false) return;
+  if (document.visibilityState === 'hidden') return;
+  TOPUP.running = true;
+  TOPUP.bad.clear();
+  TOPUP.fails = 0;
+  TOPUP.done = 0;
+  let changed = false;
+  try {
+    for (;;) {
+      if (document.visibilityState === 'hidden') break;
+      let name = ownStale()[0]?.name || null;
+      let duty = false;
+      if (!name && S.topUp !== false && (S.help | 0) > TOPUP.duty) {
+        name = oldestStale(1)[0] || null;
+        duty = !!name;
+      }
+      if (!name) break;
+      if (LIVE_BUSY.has(name)) { TOPUP.bad.add(name); continue; }
+      topUpProgress();
+      renderBars();
+      LIVE_BUSY.add(name);
+      let price = null;
+      try { price = await priceOne(name); }
+      catch (e) { /* сеть или лимит — попробуем позже */ }
+      LIVE_BUSY.delete(name);
+      if (price == null) {
+        TOPUP.bad.add(name);
+        if (++TOPUP.fails >= 6) break;
+        continue;
+      }
+      TOPUP.fails = 0;
+      liveSet(name, price);
+      if (duty) TOPUP.duty++;
+      TOPUP.done++;
+      changed = true;
+      sharePush(name, price);
+    }
+  } finally {
+    TOPUP.running = false;
+    if (changed) { save(); render(); shareAuto(); }
+    else { TOPUP.done = 0; TOPUP.total = 0; renderBars(); }
+  }
+}
+
+/* при открытии: долив по приоритетам; если он выключен — прежний массовый путь */
+function startPrices() {
+  if (S.topUp !== false) return topUpRun();
+  if (S.autoLive !== false) return autoLive();
+}
+
 function parseQuery(raw) {
   const toks = String(raw || '').toLowerCase().replace(/ё/g, 'е')
     .split(/[^0-9a-zа-яё★]+/).filter(Boolean);
@@ -655,7 +916,9 @@ function toolsHTML() {
     h += `<div class="seg tiny">${[0, 1, 2].map(n =>
       `<button data-ord="${n}" class="${S.ordFilter === n ? 'on' : ''}">${n ? n + '-й' : 'все'}</button>`).join('')}</div>`;
   }
-  h += `<button class="livebtn" data-live title="обновить цены с ТП">⟳ цены</button>`;
+  const busy = TOPUP.running && TOPUP.total;
+  h += `<button class="livebtn ${busy ? 'busy' : ''}" data-live title="обновить цены с ТП">${
+    busy ? '⟳ ' + TOPUP.done + '/' + TOPUP.total : '⟳ цены'}</button>`;
   return h + '</div>';
 }
 
@@ -960,6 +1223,7 @@ function priceTableHTML(c, it) {
 
 /* ------------------------------------------------------------------ настройки */
 function openSettings() {
+  const pending = sharePending().length;
   openSheet(`
     <div class="sheet-head">
       <div class="tt"><b>Настройки</b><span>валюты и данные</span></div>
@@ -981,6 +1245,21 @@ function openSettings() {
       <div class="sl">Обновлять цены при открытии<i>автоматически, если старше 6 часов</i></div>
       <input type="checkbox" data-autolive ${S.autoLive === false ? '' : 'checked'}>
     </label>
+    <label class="setrow" style="cursor:pointer">
+      <div class="sl">Фоновый долив<i>сначала твои скины, потом немного старых</i></div>
+      <input type="checkbox" data-topup ${S.topUp === false ? '' : 'checked'}>
+    </label>
+    <div class="setrow"><div class="sl">Сколько старых цен обновлять за сеанс<i>0 — только свои, 5 — по умолчанию</i></div>
+      <input type="number" min="0" max="200" step="1" inputmode="numeric" data-help value="${S.help}"></div>
+    <div class="setrow"><div class="sl">Токен GitHub<i>для общей базы · остаётся в этом браузере</i></div>
+      <input type="password" data-ghtoken value="${esc(S.ghToken)}" placeholder="github_pat_… (необязательно)" autocomplete="off" spellcheck="false"></div>
+    <label class="setrow" style="cursor:pointer">
+      <div class="sl">Отдавать свои цены в базу<i>тихо, не чаще раза в 20 минут</i></div>
+      <input type="checkbox" data-shareauto ${S.shareAuto === false ? '' : 'checked'}>
+    </label>
+    <div class="btnrow">
+      <button data-act="share-now">В общую базу${pending ? ' (' + pending + ')' : ''}</button>
+    </div>
     <div class="btnrow" style="margin-top:14px">
       <button data-act="collect">⟳ Сборщик цен</button>
       <button data-act="export">Экспорт</button>
@@ -998,7 +1277,12 @@ function openSettings() {
       снимок ${CAT ? new Date(CAT.generated).toLocaleString('ru-RU') : '—'}.<br>
       Источник: ${esc(CAT ? CAT.source : '—')}. Обновляется на GitHub раз в сутки.<br>
       Живые цены: Steam через публичный прокси, до 20 запросов в минуту.
-      Сборщик в поле выше не обязателен — он лишь снимает лимит и ускоряет.
+      Обновляются <b>только твои скины</b> (обе вкладки) и ещё ${S.help | 0} самых
+      старых цен за сеанс — весь каталог не качается никогда.
+      Сборщик в поле выше не обязателен — он лишь снимает лимит и ускоряет.<br>
+      Общая база: обновлённые цены уходят в <b>data/live.json</b>, если вписан
+      токен (право Contents: write на этот репозиторий). Все остальные читают
+      их при открытии — это и есть «все для всех».
     </div>
   `);
 }
@@ -1145,6 +1429,7 @@ sheet.addEventListener('click', e => {
       window.open('collect.html', '_blank', 'noopener');
       return;
     }
+    if (a === 'share-now') { flushShare(false); return; }
     if (a === 'export') return exportData();
     if (a === 'import') return importData();
     if (a === 'do-import') return applyImport();
@@ -1201,6 +1486,26 @@ sheet.addEventListener('change', e => {
     S.autoLive = !!t.checked;
     save();
   }
+  if (t.dataset.topup !== undefined) {
+    S.topUp = !!t.checked;
+    save();
+    if (S.topUp) topUpRun();
+  }
+  if (t.dataset.help !== undefined) {
+    const v = parseInt(t.value, 10);
+    S.help = isFinite(v) ? Math.max(0, Math.min(200, v)) : 5;
+    save();
+    if (S.topUp) topUpRun();
+  }
+  if (t.dataset.ghtoken !== undefined) {
+    S.ghToken = t.value.trim();
+    save();
+    toast(S.ghToken ? 'токен сохранён в этом браузере' : 'токен убран');
+  }
+  if (t.dataset.shareauto !== undefined) {
+    S.shareAuto = !!t.checked;
+    save();
+  }
 });
 
 /* ------------------------------------------------------------------ запуск */
@@ -1252,15 +1557,17 @@ async function boot() {
   setTimeout(() => { const b = $('#boot'); if (b) b.remove(); }, 500);
   loadLive().then(n => {
     if (n) { render(); toast('цены из базы: ' + n); }
-    setTimeout(() => { autoLive(); }, 400);
+    setTimeout(() => { startPrices(); }, 400);
   });
 
-  // вернулся на вкладку спустя время — проверяю, не появилось ли новых цен в базе
+  // вернулся на вкладку — подхватываю новое из базы и продолжаю долив
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState !== 'visible') return;
-    if (Date.now() - lastLiveLoad < 3 * 60e3) return;
-    const n = await loadLive();
-    if (n) { render(); toast('цены из базы: ' + n); }
+    if (Date.now() - lastLiveLoad > 3 * 60e3) {
+      const n = await loadLive();
+      if (n) { render(); toast('цены из базы: ' + n); }
+    }
+    startPrices();
   });
 }
 
