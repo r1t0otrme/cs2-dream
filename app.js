@@ -142,6 +142,11 @@ function parseUsd(s) {
   return isFinite(v) ? v : null;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* сигнал «отвались через N мс» — чтобы сеть не могла подвесить очередь */
+function deadline(ms) {
+  try { return AbortSignal.timeout(ms); }
+  catch (e) { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; }
+}
 
 /* ---------- нормализация поиска (рус/англ + транслит) ---------- */
 const TR = {а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',
@@ -302,7 +307,13 @@ function steamPriceUrl(name) {
 }
 async function jinaOnce(name) {
   await jinaSlot();
-  const r = await fetch(JINA + steamPriceUrl(name), {cache: 'no-store'});
+  // без таймаута зависший запрос держал бы весь фоновый долив
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 20000);
+  let r;
+  try {
+    r = await fetch(JINA + steamPriceUrl(name), {cache: 'no-store', signal: ctl.signal});
+  } finally { clearTimeout(tm); }
   if (r.status === 429 || r.status === 503) { const e = new Error('лимит'); e.retry = true; throw e; }
   if (!r.ok) { const e = new Error('HTTP ' + r.status); e.retry = r.status >= 500; throw e; }
   const txt = await r.text();
@@ -398,7 +409,8 @@ async function liveBulk(items, onProgress) {
   const r = await fetch(base + '/bulk', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({names, cur: 1})
+    body: JSON.stringify({names, cur: 1}),
+    signal: deadline(60000)
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
@@ -593,7 +605,8 @@ async function priceOne(name) {
   const r = await fetch(base + '/bulk', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({names: [name], cur: 1})
+    body: JSON.stringify({names: [name], cur: 1}),
+    signal: deadline(25000)
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
