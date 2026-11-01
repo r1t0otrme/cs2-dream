@@ -3,11 +3,22 @@ name: prices
 # Бот обновляет самые старые цены в data/live.json.
 # Никому не нужен токен: Actions сам коммитит результат,
 # все читатели получают свежую базу при открытии страницы.
+#
+# Работает адаптивно (см. tools/refresh_prices.py): идёт по очереди, пока
+# не кончится бюджет времени или прокси не ответит 429. Сколько успел -
+# столько и закоммитил, поэтому база не «застревает» на одном месте.
 
 on:
   schedule:
-    - cron: "17 */3 * * *"   # каждые 3 часа
+    - cron: "17 * * * *"    # каждый час
   workflow_dispatch:
+    inputs:
+      max:
+        description: "Сколько цен максимум"
+        default: "150"
+      budget:
+        description: "Бюджет времени, секунд"
+        default: "600"
 
 permissions:
   contents: write
@@ -19,7 +30,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +40,9 @@ jobs:
 
       - name: Обновить самые старые цены
         env:
-          PRICE_LIMIT: "20"
-          PRICE_PAUSE: "1.2"
+          PRICE_MAX: ${{ github.event.inputs.max || '150' }}
+          PRICE_BUDGET: ${{ github.event.inputs.budget || '600' }}
+          PRICE_PAUSE: "1.0"
         run: python tools/refresh_prices.py
 
       - name: Закоммитить, если что-то изменилось
@@ -42,6 +54,6 @@ jobs:
             echo "нечего коммитить"
             exit 0
           fi
-          git commit -m "цены: автообновление (20 самых старых)"
+          git commit -m "цены: автообновление (самые старые)"
           git pull --rebase --autostash
           git push

@@ -4,11 +4,16 @@
 Запускается ботом в GitHub Actions (см. .github/workflows/prices.yml),
 поэтому никому не нужен токен: база обновляется сама.
 
-    python tools/refresh_prices.py            # 20 самых старых
-    PRICE_LIMIT=50 python tools/refresh_prices.py
+    python tools/refresh_prices.py            # ~150 самых старых, до 10 минут
+    PRICE_MAX=50 python tools/refresh_prices.py
 
-Цена берётся через публичный прокси r.jina.ai (Steam не отдаёт CORS,
-а серверные IP Steam режет 429-ми - Jina ходит со своих адресов).
+Работает адаптивно: идёт по списку самых старых, пока не кончится время
+(PRICE_BUDGET), не упрётся в PRICE_MAX или пока прокси не скажет «хватит»
+(429/503). В последнем случае сохранённое всё равно коммитится - прогресс
+не теряется.
+
+Цена берётся через публичный прокси r.jina.ai: Steam не отдаёт CORS,
+а серверные IP Steam режет 429-ми - Jina ходит со своих адресов.
 """
 import json
 import os
@@ -22,11 +27,24 @@ from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIVE = os.path.join(ROOT, "data", "live.json")
-LIMIT = int(os.environ.get("PRICE_LIMIT", "20") or 20)
+MAX = int(os.environ.get("PRICE_MAX", "150") or 150)
+BUDGET = float(os.environ.get("PRICE_BUDGET", "600") or 600)
+PAUSE = float(os.environ.get("PRICE_PAUSE", "1.0") or 1.0)
 JINA = "https://r.jina.ai/"
-PAUSE = float(os.environ.get("PRICE_PAUSE", "1.2") or 1.2)
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+class Limited(Exception):
+    """прокси сказал «слишком много запросов» - дальше долбить бессмысленно"""
+
+
+class NoPrice(Exception):
+    """страница открылась, но цены у предмета нет (снят с продажи)"""
+
+
+class Transient(Exception):
+    """не получилось проверить: сеть, 5xx, неожиданный ответ"""
 
 
 def now_iso():
@@ -56,7 +74,7 @@ def parse_usd(s):
     return v if 0.01 <= v <= 1_000_000 else None
 
 
-def fetch(name, tries=3):
+def fetch(name, tries=2):
     url = JINA + steam_url(name)
     for k in range(tries):
         try:
@@ -67,15 +85,27 @@ def fetch(name, tries=3):
             with urllib.request.urlopen(req, timeout=40) as r:
                 txt = r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
+            # 429/503 - лимит; 451/403 - прокси блокирует адрес.
+            # И то, и другое значит «сейчас проверить нельзя», а не
+            # «предмета нет»: базу этим портить нельзя.
             if e.code in (429, 503):
+                if k + 1 >= tries:
+                    raise Limited(f"HTTP {e.code}")
                 time.sleep(3 + k * 3)
                 continue
-            print("  HTTP", e.code, name)
-            return None
+            if e.code in (451, 403):
+                raise Limited(f"HTTP {e.code}")
+            if 500 <= e.code < 600 and k + 1 < tries:
+                time.sleep(2 + k * 2)
+                continue
+            raise Transient(f"HTTP {e.code}")
+        except Limited:
+            raise
         except Exception as e:
-            print("  сеть:", type(e).__name__, name)
-            time.sleep(2 + k * 2)
-            continue
+            if k + 1 < tries:
+                time.sleep(2 + k * 2)
+                continue
+            raise Transient(type(e).__name__)
 
         lo = re.search(r'"lowest_price"\s*:\s*"([^"]*)"', txt)
         md = re.search(r'"median_price"\s*:\s*"([^"]*)"', txt)
@@ -84,8 +114,17 @@ def fetch(name, tries=3):
             v = parse_usd(md.group(1))
         if v is not None:
             return v
-        return None
-    return None
+        if '"success"' in txt or "lowest_price" in txt or "median_price" in txt:
+            raise NoPrice(name)
+        raise Transient("не похоже на страницу Steam")
+    raise Transient("не удалось")
+
+
+def ts_of(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 def main():
@@ -93,48 +132,81 @@ def main():
         doc = json.load(f)
     prices = doc.get("prices") or {}
     if not prices:
-        print("база пуста — нечего обновлять")
+        print("база пуста - нечего обновлять")
         return 0
 
-    def ts(row):
-        try:
-            return datetime.fromisoformat(str(row[1]).replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return 0.0
+    # checked: когда предмет проверяли в последний раз. Нужен, чтобы цены,
+    # которых нет в продаже, не занимали очередь бота каждый запуск.
+    checked = doc.get("checked") or {}
 
-    oldest = sorted(prices.items(), key=lambda kv: ts(kv[1]))[:LIMIT]
-    print("в базе:", len(prices), "| обновляю:", len(oldest))
+    def age(name, row):
+        row_ts = row[1] if isinstance(row, list) and len(row) > 1 else None
+        return max(ts_of(row_ts), ts_of(checked.get(name)))
+
+    queue = sorted(prices.keys(), key=lambda n: age(n, prices[n]))[:MAX]
+    print(f"в базе: {len(prices)} | в очереди: {len(queue)} | "
+          f"лимит {MAX}, бюджет {int(BUDGET)} с")
     stamp = now_iso()
-    changed = 0
-    fails = 0
-    for i, (name, row) in enumerate(oldest, 1):
-        p = fetch(name)
-        if p is None:
+    started = time.monotonic()
+    changed = misses = fails = done = 0
+    limited = False
+
+    for i, name in enumerate(queue, 1):
+        if time.monotonic() - started > BUDGET:
+            print(f"время вышло на {i}/{len(queue)}")
+            break
+        try:
+            p = fetch(name)
+        except Limited as e:
+            print(f"{i}/{len(queue)} - прокси просит паузу ({e}), останавливаюсь")
+            limited = True
+            break
+        except NoPrice:
+            done += 1
+            misses += 1
+            # запоминаем, что проверили: снятый с продажи предмет
+            # не должен каждый раз занимать начало очереди
+            checked[name] = stamp
+            print(f"{i}/{len(queue)} - нет в продаже: {name}")
+            time.sleep(PAUSE)
+            continue
+        except Transient as e:
             fails += 1
-            print(f"{i}/{len(oldest)} — нет цены: {name}")
-            if fails >= 5:
-                print("пять промахов подряд — похоже, прокси режет, останавливаюсь")
+            print(f"{i}/{len(queue)} - не проверить ({e}): {name}")
+            if fails >= 8:
+                print("восемь промахов подряд - прокси не отвечает, останавливаюсь")
                 break
+            time.sleep(PAUSE)
+            continue
+
+        done += 1
+        fails = 0
+        row = prices.get(name)
+        old = row[0] if isinstance(row, list) and row else None
+        prices[name] = [p, stamp]
+        checked.pop(name, None)
+        if old is None or abs(float(old) - p) >= 0.005:
+            changed += 1
+            print(f"{i}/{len(queue)} - {name}: {old} -> {p}")
         else:
-            fails = 0
-            old = row[0] if isinstance(row, list) and row else None
-            prices[name] = [p, stamp]
-            if old is None or abs(float(old) - p) >= 0.005:
-                changed += 1
-                print(f"{i}/{len(oldest)} — {name}: {old} -> {p}")
-            else:
-                print(f"{i}/{len(oldest)} — {name}: {p} (без изменений)")
+            print(f"{i}/{len(queue)} - {name}: {p} (без изменений)")
+
         time.sleep(PAUSE)
 
     if not changed:
         # время всё равно двигаем, иначе бот будет вечно долбить те же записи
-        print("цены не изменились, но отметка времени обновлена")
+        print("цены не изменились, но отметки времени обновлены")
+
     doc["prices"] = prices
+    if checked:
+        doc["checked"] = checked
     doc["generated"] = stamp
+    doc["bot"] = {"run": stamp, "done": done, "changed": changed,
+                  "misses": misses, "stopped": "limit" if limited else "done"}
     with open(LIVE, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
-    print("готово: изменено", changed, "| всего", len(prices))
+    print(f"готово: проверено {done}, изменено {changed}, без цены {misses}")
     return 0
 
 
